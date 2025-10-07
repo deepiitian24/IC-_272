@@ -276,7 +276,13 @@ class DecisionTree():
               left and right datasets.
         """
         # dictionary to store the best split values
-        best_split = {'gain':- 1, 'feature': None, 'threshold': None}
+        best_split = {
+            'gain': float('-inf'),
+            'feature': None,
+            'threshold': None,
+            'left_dataset': None,
+            'right_dataset': None,
+        }
         # choose subset of features for this split (if enabled)
         k_features = self._resolve_max_features(num_features)
         if k_features < num_features:
@@ -343,7 +349,7 @@ class DecisionTree():
             # Get the best split
             best_split = self.best_split(dataset, n_samples, n_features)
             # Check if gain isn't zero
-            if best_split["gain"]:
+            if (best_split["gain"] is not None) and (best_split["gain"] > 0) and (best_split["left_dataset"] is not None):
               # record importance for the feature
                 feature_index = best_split["feature"]
                 gain_value = best_split["gain"]
