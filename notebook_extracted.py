@@ -111,7 +111,7 @@ class DecisionTree():
     A decision tree classifier for binary classification problems.
     """
 
-    def __init__(self, min_samples=2, max_depth=2):
+    def __init__(self, min_samples=2, max_depth=2, max_features_per_split=None, random_state=None):
         """
         Constructor for DecisionTree class.
 
@@ -121,6 +121,8 @@ class DecisionTree():
         """
         self.min_samples = min_samples
         self.max_depth = max_depth
+        self.max_features_per_split = max_features_per_split
+        self.rng = np.random.default_rng(random_state)
         # empty dictionary to store feature importance
         self.feature_importance = {}
 
@@ -207,6 +209,23 @@ class DecisionTree():
         return information_gain
 
 
+    def _resolve_max_features(self, num_features: int) -> int:
+        mf = self.max_features_per_split
+        if mf is None:
+            return num_features
+        if isinstance(mf, str):
+            mf_l = mf.lower()
+            if mf_l == "sqrt":
+                return max(1, int(math.sqrt(num_features)))
+            if mf_l == "log2":
+                return max(1, int(math.log2(num_features)))
+            return num_features
+        if isinstance(mf, float):
+            return max(1, int(num_features * mf))
+        if isinstance(mf, int):
+            return max(1, min(num_features, mf))
+        return num_features
+
     def best_split(self, dataset, num_samples, num_features):
         """
         Finds the best split for the given dataset.
@@ -222,8 +241,14 @@ class DecisionTree():
         """
         # dictionary to store the best split values
         best_split = {'gain':- 1, 'feature': None, 'threshold': None}
-        # loop over all the features
-        for feature_index in range(num_features):
+        # choose subset of features for this split (if enabled)
+        k_features = self._resolve_max_features(num_features)
+        if k_features < num_features:
+            feature_indices_iter = self.rng.choice(num_features, size=k_features, replace=False)
+        else:
+            feature_indices_iter = range(num_features)
+        # loop over chosen features
+        for feature_index in feature_indices_iter:
             #get the feature at the current feature_index
             feature_values = dataset[:, feature_index]
             #get unique values of that feature
@@ -363,6 +388,84 @@ class DecisionTree():
             else:
                 return self.make_prediction(x, node.right)
 
+# ==== Notebook code cell 16.1 (helpers for post-pruning) ====
+def _postorder_nodes(node):
+    nodes = []
+    def visit(n):
+        if n is None:
+            return
+        if n.value is None:
+            visit(n.left)
+            visit(n.right)
+        nodes.append(n)
+    visit(node)
+    return nodes
+
+def _collect_train_indices_per_node(node, X: np.ndarray, indices: np.ndarray, mapping: dict):
+    mapping[id(node)] = indices
+    if node.value is None and indices.size > 0:
+        left_mask = X[indices, node.feature] <= node.threshold
+        left_idx = indices[left_mask]
+        right_idx = indices[~left_mask]
+        _collect_train_indices_per_node(node.left, X, left_idx, mapping)
+        _collect_train_indices_per_node(node.right, X, right_idx, mapping)
+
+def reduced_error_prune(model: DecisionTree,
+                        X_train: np.ndarray,
+                        y_train: np.ndarray,
+                        X_val: np.ndarray,
+                        y_val: np.ndarray) -> tuple[int, float]:
+    """
+    Perform Reduced Error Post-Pruning on a fully grown tree using validation set.
+
+    Returns (num_pruned_nodes, best_val_accuracy_after_pruning)
+    """
+    # Baseline validation accuracy
+    def validate_acc() -> float:
+        preds = np.array(model.predict(X_val), dtype=int)
+        return float(np.sum(preds == y_val.flatten()) / y_val.shape[0])
+
+    best_val_acc = validate_acc()
+    total_pruned = 0
+
+    # Precompute training indices per node once from the original tree
+    node_to_indices: dict[int, np.ndarray] = {}
+    _collect_train_indices_per_node(model.root, X_train, np.arange(X_train.shape[0]), node_to_indices)
+
+    while True:
+        pruned_this_pass = 0
+        nodes = _postorder_nodes(model.root)
+        for node in nodes:
+            if node is None or node.value is not None:
+                continue  # skip leaves
+            # Backup
+            backup = (node.feature, node.threshold, node.left, node.right, node.gain, node.value)
+            # Majority class at this node from training samples
+            idx = node_to_indices.get(id(node), np.array([], dtype=int))
+            if idx.size == 0:
+                majority_value = 0 if np.mean(y_train) < 0.5 else 1
+            else:
+                majority_value = model.calculate_leaf_value(y_train[idx])
+            # Prune: make it a leaf
+            node.feature = None
+            node.threshold = None
+            node.left = None
+            node.right = None
+            node.gain = None
+            node.value = majority_value
+            # Evaluate
+            new_val_acc = validate_acc()
+            if new_val_acc + 1e-12 >= best_val_acc:
+                best_val_acc = new_val_acc
+                pruned_this_pass += 1
+            else:
+                # Revert
+                node.feature, node.threshold, node.left, node.right, node.gain, node.value = backup
+        if pruned_this_pass == 0:
+            break
+        total_pruned += pruned_this_pass
+    return total_pruned, best_val_acc
+
 # ==== Notebook code cell 17 (added) ====
 class RandomForest:
     """
@@ -409,10 +512,8 @@ class RandomForest:
             return max(1, min(num_features, mf))
         return num_features
 
-    def _bootstrap_sample(self, X: np.ndarray, y: np.ndarray, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
-        n_samples = X.shape[0]
-        indices = rng.integers(0, n_samples, size=n_samples)
-        return X[indices], y[indices]
+    def _bootstrap_indices(self, n_samples: int, rng: np.random.Generator) -> np.ndarray:
+        return rng.integers(0, n_samples, size=n_samples)
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> "RandomForest":
         rng = np.random.default_rng(self.random_state)
@@ -420,24 +521,38 @@ class RandomForest:
         self.feature_indices_per_estimator_.clear()
         aggregated_importance: dict[int, float] = {}
 
-        num_features = X.shape[1]
+        n_samples, num_features = X.shape
         k_features = self._resolve_max_features(num_features)
 
-        for _ in range(self.n_estimators):
-            # Bootstrap sampling
-            if self.bootstrap:
-                X_boot, y_boot = self._bootstrap_sample(X, y, rng)
-            else:
-                X_boot, y_boot = X, y
+        # Track OOB votes across trees
+        oob_vote_sum = np.zeros(n_samples, dtype=float)
+        oob_vote_count = np.zeros(n_samples, dtype=int)
+        self.oob_error_curve_: list[float] = []
 
-            # Feature subsampling
+        for i in range(self.n_estimators):
+            # Bootstrap sampling (by indices)
+            if self.bootstrap:
+                boot_indices = self._bootstrap_indices(n_samples, rng)
+            else:
+                boot_indices = np.arange(n_samples)
+
+            oob_mask = np.ones(n_samples, dtype=bool)
+            oob_mask[boot_indices] = False
+
+            # Feature subsampling for the whole tree input space
             feature_indices = rng.choice(num_features, size=k_features, replace=False)
             feature_indices = np.array(sorted(feature_indices))
 
-            # Train a DecisionTree on the subset of features
-            X_boot_subset = X_boot[:, feature_indices]
-            tree = DecisionTree(min_samples=self.min_samples, max_depth=self.max_depth)
-            tree.fit(X_boot_subset, y_boot)
+            # Train a DecisionTree on the subset of features with per-split sampling enabled
+            X_boot_subset = X[boot_indices][:, feature_indices]
+            y_boot_subset = y[boot_indices]
+            tree = DecisionTree(
+                min_samples=self.min_samples,
+                max_depth=self.max_depth,
+                max_features_per_split=self.max_features,
+                random_state=(None if self.random_state is None else self.random_state + i),
+            )
+            tree.fit(X_boot_subset, y_boot_subset)
 
             self.estimators_.append(tree)
             self.feature_indices_per_estimator_.append(feature_indices)
@@ -447,7 +562,24 @@ class RandomForest:
                 global_idx = int(feature_indices[int(local_idx)])
                 aggregated_importance[global_idx] = aggregated_importance.get(global_idx, 0.0) + float(gain)
 
-        # Normalize to sum to 1
+            # OOB predictions update
+            if np.any(oob_mask):
+                preds_list = tree.predict(X[oob_mask][:, feature_indices])
+                preds = np.array(preds_list, dtype=float)
+                oob_vote_sum[oob_mask] += preds
+                oob_vote_count[oob_mask] += 1
+
+            # Compute current OOB error (exclude samples with 0 OOB votes)
+            valid_mask = oob_vote_count > 0
+            if np.any(valid_mask):
+                oob_pred = (oob_vote_sum[valid_mask] >= (oob_vote_count[valid_mask] / 2.0)).astype(int)
+                y_valid = y[valid_mask]
+                oob_error = 1.0 - (np.sum(oob_pred == y_valid) / y_valid.shape[0])
+                self.oob_error_curve_.append(float(oob_error))
+            else:
+                self.oob_error_curve_.append(float('nan'))
+
+        # Normalize feature importances to sum to 1
         total_gain = sum(aggregated_importance.values())
         if total_gain > 0:
             for fi in list(aggregated_importance.keys()):
@@ -499,15 +631,36 @@ X_test_np  = X_test.to_numpy()
 y_test_np  = y_test.to_numpy()
 X_val_np   = X_val.to_numpy()
 y_val_np   = y_val.to_numpy()
-# Create and train model
-model = DecisionTree(max_depth=8, min_samples=10)
+# Create and train models
+# Unpruned tree (for post-pruning):
+unpruned_tree = DecisionTree(max_depth=None, min_samples=2, random_state=42)
+unpruned_tree.fit(X_train_np, y_train_np)
+
+# Pre-pruned tree at selected depth (example depth=8 as before):
+model = DecisionTree(max_depth=8, min_samples=10, random_state=43)
 model.fit(X_train_np, y_train_np)
 
 # ==== Notebook code cell 19 ====
 y_pred = model.predict(X_test_np)
+unpruned_test_pred = unpruned_tree.predict(X_test_np)
 
 # ==== Notebook code cell 20 ====
-print(f'  Unpruned Tree accuracy is {accuracy(y_test_np,y_pred)}')
+print(f'  Pre-Pruned Tree accuracy is {accuracy(y_test_np,y_pred)}')
+print(f'  Unpruned Tree (before pruning) test accuracy is {accuracy(y_test_np, unpruned_test_pred)}')
+
+# ==== Notebook code cell 20.0 (Reduced Error Post-Pruning) ====
+unpruned_val_pred = unpruned_tree.predict(X_val_np)
+val_acc_before = accuracy(y_val_np, np.array(unpruned_val_pred))
+num_pruned, val_acc_after = reduced_error_prune(
+    unpruned_tree, X_train_np, y_train_np, X_val_np, y_val_np
+)
+unpruned_val_pred_after = unpruned_tree.predict(X_val_np)
+unpruned_test_pred_after = unpruned_tree.predict(X_test_np)
+test_acc_after = accuracy(y_test_np, np.array(unpruned_test_pred_after))
+
+print(f"Reduced Error Pruning: pruned {num_pruned} nodes")
+print(f"Validation accuracy before: {val_acc_before:.3f} after: {val_acc_after:.3f}")
+print(f"Test accuracy before: {accuracy(y_test_np, np.array(unpruned_test_pred)):.3f} after: {test_acc_after:.3f}")
 
 # ==== Notebook code cell 20.1 (RandomForest training) ====
 # Train a RandomForest on the same data
@@ -576,13 +729,24 @@ for depth in depth_values:
 
 plt.figure(figsize=(8,5))
 plt.plot(depth_values, train_acc, marker='o', label='Train Accuracy')
-plt.plot(depth_values, test_acc, marker='s', label='Test Accuracy')
+plt.plot(depth_values, test_acc, marker='s', label='Val Accuracy')
 plt.xlabel("Max Depth")
 plt.ylabel("Accuracy")
 plt.title("Effect of max_depth (Pre-pruning Parameter)")
 plt.legend()
 plt.grid(True)
 plt.show()
+
+# ==== Notebook code cell 26 (OOB Error vs Trees) ====
+if hasattr(rf, 'oob_error_curve_') and len(rf.oob_error_curve_) > 0:
+    plt.figure(figsize=(8,5))
+    xs = np.arange(1, len(rf.oob_error_curve_) + 1)
+    plt.plot(xs, rf.oob_error_curve_, marker='o')
+    plt.xlabel('Number of Trees')
+    plt.ylabel('OOB Error')
+    plt.title('RandomForest OOB Error vs Number of Trees')
+    plt.grid(True)
+    plt.show()
 
 # ---------- 2️⃣ Effect of min_samples_split ----------
 train_acc2 = []
@@ -600,10 +764,26 @@ for s in split_values:
 
 plt.figure(figsize=(8,5))
 plt.plot(split_values, train_acc2, marker='o', label='Train Accuracy')
-plt.plot(split_values, test_acc2, marker='s', label='Test Accuracy')
+plt.plot(split_values, test_acc2, marker='s', label='Val Accuracy')
 plt.xlabel("Minimum Samples to Split (min_samples)")
 plt.ylabel("Accuracy")
 plt.title("Effect of min_samples (Pre-pruning Parameter)")
 plt.legend()
 plt.grid(True)
+plt.show()
+
+# ==== Notebook code cell 25 (Accuracy Bar Chart) ====
+unpruned_post_test_acc = test_acc_after
+prepruned_test_acc = accuracy(y_test_np, np.array(y_pred))
+unpruned_pre_test_acc = accuracy(y_test_np, np.array(unpruned_test_pred))
+
+labels = ["Unpruned", "Pre-Pruned", "Post-Pruned"]
+scores = [unpruned_pre_test_acc, prepruned_test_acc, unpruned_post_test_acc]
+plt.figure(figsize=(7,5))
+bars = plt.bar(labels, scores, color=["#999", "#4caf50", "#2196f3"])
+plt.ylim(0, 1)
+plt.ylabel("Test Accuracy")
+plt.title("Decision Tree Accuracies: Unpruned vs Pre-Pruned vs Post-Pruned")
+for bar, s in zip(bars, scores):
+    plt.text(bar.get_x() + bar.get_width()/2, s + 0.01, f"{s:.2f}", ha='center')
 plt.show()
