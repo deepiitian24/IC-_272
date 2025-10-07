@@ -13,7 +13,43 @@ import math
 np.random.seed(42)
 
 # ==== Notebook code cell 3 ====
-df=pd.read_csv('/content/Company_Data.csv')
+from pathlib import Path
+import os
+
+def _find_dataset_path() -> str | None:
+    env_path = os.getenv('COMPANY_DATA_CSV')
+    if env_path and Path(env_path).exists():
+        return env_path
+
+    # Exact filename anywhere
+    exact = list(Path('.').rglob('Company_Data.csv'))
+    if exact:
+        return str(exact[0])
+
+    # Case-insensitive search for files containing 'company' and 'data'
+    ci = []
+    for p in Path('.').rglob('*.csv'):
+        name = p.name.lower()
+        if ('company' in name) and ('data' in name):
+            ci.append(p)
+    if ci:
+        # pick the first one
+        return str(ci[0])
+
+    # Fallback to root
+    fallback = Path('./Company_Data.csv')
+    return str(fallback) if fallback.exists() else None
+
+_csv_path = _find_dataset_path()
+print(f"Working directory: {os.getcwd()}")
+if _csv_path is None:
+    print("ERROR: Could not find 'Company_Data.csv'. Set env COMPANY_DATA_CSV=/absolute/path/to/Company_Data.csv.")
+    # Listing available CSVs for convenience
+    found = [str(p) for p in Path('.').rglob('*.csv')]
+    print(f"Found CSV files: {found}")
+    raise SystemExit(2)
+print(f"Loading dataset from: {_csv_path}")
+df=pd.read_csv(_csv_path)
 
 # ==== Notebook code cell 4 ====
 print(df.info())
