@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+import math
 
 # ==== Notebook code cell 2 ====
 np.random.seed(42)
@@ -362,6 +363,115 @@ class DecisionTree():
             else:
                 return self.make_prediction(x, node.right)
 
+# ==== Notebook code cell 17 (added) ====
+class RandomForest:
+    """
+    Random Forest classifier built on the custom DecisionTree above.
+
+    Uses bootstrap sampling and feature subsampling (max_features) per tree.
+    """
+
+    def __init__(
+        self,
+        n_estimators: int = 100,
+        max_depth: int | None = None,
+        min_samples: int = 2,
+        max_features: int | float | str | None = "sqrt",
+        bootstrap: bool = True,
+        random_state: int | None = None,
+    ) -> None:
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.min_samples = min_samples
+        self.max_features = max_features
+        self.bootstrap = bootstrap
+        self.random_state = random_state
+
+        self.estimators_: list[DecisionTree] = []
+        self.feature_indices_per_estimator_: list[np.ndarray] = []
+        # Map of original feature index -> normalized importance
+        self.feature_importances_: dict[int, float] = {}
+
+    def _resolve_max_features(self, num_features: int) -> int:
+        mf = self.max_features
+        if mf is None:
+            return num_features
+        if isinstance(mf, str):
+            if mf.lower() == "sqrt":
+                return max(1, int(math.sqrt(num_features)))
+            if mf.lower() == "log2":
+                return max(1, int(math.log2(num_features)))
+            return num_features
+        if isinstance(mf, float):
+            # treat as fraction
+            return max(1, int(num_features * mf))
+        if isinstance(mf, int):
+            return max(1, min(num_features, mf))
+        return num_features
+
+    def _bootstrap_sample(self, X: np.ndarray, y: np.ndarray, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
+        n_samples = X.shape[0]
+        indices = rng.integers(0, n_samples, size=n_samples)
+        return X[indices], y[indices]
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "RandomForest":
+        rng = np.random.default_rng(self.random_state)
+        self.estimators_.clear()
+        self.feature_indices_per_estimator_.clear()
+        aggregated_importance: dict[int, float] = {}
+
+        num_features = X.shape[1]
+        k_features = self._resolve_max_features(num_features)
+
+        for _ in range(self.n_estimators):
+            # Bootstrap sampling
+            if self.bootstrap:
+                X_boot, y_boot = self._bootstrap_sample(X, y, rng)
+            else:
+                X_boot, y_boot = X, y
+
+            # Feature subsampling
+            feature_indices = rng.choice(num_features, size=k_features, replace=False)
+            feature_indices = np.array(sorted(feature_indices))
+
+            # Train a DecisionTree on the subset of features
+            X_boot_subset = X_boot[:, feature_indices]
+            tree = DecisionTree(min_samples=self.min_samples, max_depth=self.max_depth)
+            tree.fit(X_boot_subset, y_boot)
+
+            self.estimators_.append(tree)
+            self.feature_indices_per_estimator_.append(feature_indices)
+
+            # Map tree-specific feature importances back to original feature indices
+            for local_idx, gain in tree.feature_importance.items():
+                global_idx = int(feature_indices[int(local_idx)])
+                aggregated_importance[global_idx] = aggregated_importance.get(global_idx, 0.0) + float(gain)
+
+        # Normalize to sum to 1
+        total_gain = sum(aggregated_importance.values())
+        if total_gain > 0:
+            for fi in list(aggregated_importance.keys()):
+                aggregated_importance[fi] = aggregated_importance[fi] / total_gain
+        self.feature_importances_ = aggregated_importance
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        if not self.estimators_:
+            raise ValueError("RandomForest is not fitted yet")
+
+        n_samples = X.shape[0]
+        votes_sum = np.zeros(n_samples, dtype=float)
+        n_trees = len(self.estimators_)
+
+        for tree, feat_idx in zip(self.estimators_, self.feature_indices_per_estimator_):
+            preds_list = tree.predict(X[:, feat_idx])
+            preds = np.array(preds_list, dtype=float)
+            votes_sum += preds
+
+        # Majority vote for binary classification (labels 0/1)
+        majority = (votes_sum >= (n_trees / 2.0)).astype(int)
+        return majority
+
 # ==== Notebook code cell 17 ====
 def accuracy(y_true, y_pred):
     """
@@ -399,6 +509,20 @@ y_pred = model.predict(X_test_np)
 # ==== Notebook code cell 20 ====
 print(f'  Unpruned Tree accuracy is {accuracy(y_test_np,y_pred)}')
 
+# ==== Notebook code cell 20.1 (RandomForest training) ====
+# Train a RandomForest on the same data
+rf = RandomForest(
+    n_estimators=50,
+    max_depth=8,
+    min_samples=10,
+    max_features="sqrt",
+    bootstrap=True,
+    random_state=42,
+)
+rf.fit(X_train_np, y_train_np)
+rf_pred = rf.predict(X_test_np)
+print(f"  RandomForest accuracy is {accuracy(y_test_np, rf_pred)}")
+
 # ==== Notebook code cell 21 ====
 def precision(y_true, y_pred):
     tp = np.sum((y_true == 1) & (y_pred == 1))
@@ -419,12 +543,21 @@ def f1_score(y_true, y_pred):
 p = precision(y_test_np, np.array(y_pred))
 r = recall(y_test_np, np.array(y_pred))
 f1 = f1_score(y_test_np, np.array(y_pred))
+print(f"DT Precision: {p:.2f}, Recall: {r:.2f}, F1 Score: {f1:.2f}")
 
-print(f"Precision: {p:.2f}, Recall: {r:.2f}, F1 Score: {f1:.2f}")
+# RF metrics
+p_rf = precision(y_test_np, np.array(rf_pred))
+r_rf = recall(y_test_np, np.array(rf_pred))
+f1_rf = f1_score(y_test_np, np.array(rf_pred))
+print(f"RF Precision: {p_rf:.2f}, Recall: {r_rf:.2f}, F1 Score: {f1_rf:.2f}")
 
 # ==== Notebook code cell 23 ====
-print("Feature importances:")
+print("Feature importances (DecisionTree):")
 for idx, score in model.feature_importance.items():
+    print(f"Feature {idx} , {X.columns[idx]} = {round(score, 3)}")
+
+print("Feature importances (RandomForest):")
+for idx, score in sorted(rf.feature_importances_.items()):
     print(f"Feature {idx} , {X.columns[idx]} = {round(score, 3)}")
 
 # ==== Notebook code cell 24 ====
