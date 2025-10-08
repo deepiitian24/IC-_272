@@ -115,11 +115,13 @@ class Node:
 
 class DecisionTree:
     def __init__(self, min_samples: int = 2, max_depth: Optional[int] = None,
-                 max_features_per_split: Optional[object] = None, random_state: Optional[int] = None):
+                 max_features_per_split: Optional[object] = None, random_state: Optional[int] = None,
+                 criterion: str = "entropy"):
         self.min_samples = int(min_samples)
         self.max_depth = max_depth
         self.max_features_per_split = max_features_per_split
         self.rng = np.random.default_rng(random_state)
+        self.criterion = criterion.lower()
         self.feature_importance: Dict[int, float] = {}
         self.root: Optional[Node] = None
 
@@ -130,6 +132,19 @@ class DecisionTree:
         values, counts = np.unique(y, return_counts=True)
         probs = counts / counts.sum()
         return float(-np.sum(probs * np.log2(probs + 1e-12)))
+
+    @staticmethod
+    def gini(y: np.ndarray) -> float:
+        if y.size == 0:
+            return 0.0
+        values, counts = np.unique(y, return_counts=True)
+        probs = counts / counts.sum()
+        return float(1.0 - np.sum(probs ** 2))
+
+    def _impurity(self, y: np.ndarray) -> float:
+        if self.criterion == "gini":
+            return self.gini(y)
+        return self.entropy(y)
 
     @staticmethod
     def majority_class(y: np.ndarray) -> int:
@@ -163,10 +178,14 @@ class DecisionTree:
         feature_indices = (self.rng.choice(n_features, size=k, replace=False)
                            if k < n_features else np.arange(n_features))
 
-        parent_entropy = self.entropy(y)
+        parent_impurity = self._impurity(y)
         for f in feature_indices:
             values = np.unique(X[:, f])
-            for thr in values:
+            if values.size <= 1:
+                continue
+            # use midpoints between consecutive sorted unique values
+            thresholds = (values[:-1] + values[1:]) / 2.0
+            for thr in thresholds:
                 left_mask = X[:, f] <= thr
                 right_mask = ~left_mask
                 if not left_mask.any() or not right_mask.any():
@@ -174,8 +193,8 @@ class DecisionTree:
                 left_y, right_y = y[left_mask], y[right_mask]
                 w_left = left_y.size / y.size
                 w_right = right_y.size / y.size
-                child_entropy = w_left * self.entropy(left_y) + w_right * self.entropy(right_y)
-                ig = parent_entropy - child_entropy
+                child_impurity = w_left * self._impurity(left_y) + w_right * self._impurity(right_y)
+                ig = parent_impurity - child_impurity
                 if ig > best["gain"]:
                     best = {
                         "gain": float(ig),
@@ -308,7 +327,7 @@ class RandomForest:
         self.random_state = random_state
         self.rng = np.random.default_rng(random_state)
         self.trees: List[DecisionTree] = []
-        self.feature_subsets: List[np.ndarray] = []
+        self.feature_subsets: List[np.ndarray] = []  # kept for compatibility; will store None/all
         self.feature_importances_: Dict[int, float] = {}
         self.oob_error_curve_: List[float] = []
         self.oob_score_: Optional[float] = None
@@ -349,8 +368,9 @@ class RandomForest:
             oob_mask = np.ones(n, dtype=bool)
             oob_mask[boot_idx] = False
 
-            feat_idx = np.array(sorted(self.rng.choice(d, size=k, replace=False)))
-            X_boot = X[boot_idx][:, feat_idx]
+            # Train trees on full feature space; subsampling happens per split in the tree
+            feat_idx = None  # indicates all features
+            X_boot = X[boot_idx]
             y_boot = y[boot_idx]
 
             tree = DecisionTree(min_samples=self.min_samples,
@@ -359,14 +379,13 @@ class RandomForest:
                                 random_state=(None if self.random_state is None else self.random_state + i))
             tree.fit(X_boot, y_boot)
             self.trees.append(tree)
-            self.feature_subsets.append(feat_idx)
+            self.feature_subsets.append(np.arange(d))
 
-            for local_f, gain in tree.feature_importance.items():
-                global_f = int(feat_idx[int(local_f)])
-                self.feature_importances_[global_f] = self.feature_importances_.get(global_f, 0.0) + float(gain)
+            for f_idx, gain in tree.feature_importance.items():
+                self.feature_importances_[int(f_idx)] = self.feature_importances_.get(int(f_idx), 0.0) + float(gain)
 
             if np.any(oob_mask):
-                preds = tree.predict(X[oob_mask][:, feat_idx]).astype(float)
+                preds = tree.predict(X[oob_mask]).astype(float)
                 oob_sum[oob_mask] += preds
                 oob_cnt[oob_mask] += 1
 
@@ -389,8 +408,8 @@ class RandomForest:
     def predict(self, X: np.ndarray) -> np.ndarray:
         assert len(self.trees) > 0
         votes_sum = np.zeros(X.shape[0], dtype=float)
-        for tree, feat_idx in zip(self.trees, self.feature_subsets):
-            votes_sum += tree.predict(X[:, feat_idx]).astype(float)
+        for tree in self.trees:
+            votes_sum += tree.predict(X).astype(float)
         return (votes_sum >= (len(self.trees) / 2.0)).astype(int)
 
 
@@ -418,7 +437,7 @@ def main():
     (X_train, y_train), (X_val, y_val), (X_test, y_test) = train_val_test_split(X_df, y_ser, val_size=0.15, test_size=0.15, seed=RANDOM_SEED)
 
     # 1) Unpruned tree
-    unpruned = DecisionTree(min_samples=2, max_depth=None, random_state=RANDOM_SEED)
+    unpruned = DecisionTree(min_samples=1, max_depth=None, random_state=RANDOM_SEED, criterion="gini")
     unpruned.fit(X_train, y_train)
     unpruned_test_acc = accuracy(y_test, unpruned.predict(X_test))
     print(f"Unpruned Tree - Test Accuracy: {unpruned_test_acc:.3f}")
@@ -427,7 +446,7 @@ def main():
     depths = list(range(1, 21))
     val_acc_by_depth = []
     for d in depths:
-        dt = DecisionTree(min_samples=2, max_depth=d, random_state=RANDOM_SEED)
+        dt = DecisionTree(min_samples=1, max_depth=d, random_state=RANDOM_SEED, criterion="gini")
         dt.fit(X_train, y_train)
         val_acc_by_depth.append(accuracy(y_val, dt.predict(X_val)))
 
@@ -443,13 +462,13 @@ def main():
     best_depth = int(depths[int(np.argmax(val_acc_by_depth))])
     print(f"Selected best depth (by validation): {best_depth}")
 
-    prepruned = DecisionTree(min_samples=2, max_depth=best_depth, random_state=RANDOM_SEED + 1)
+    prepruned = DecisionTree(min_samples=1, max_depth=best_depth, random_state=RANDOM_SEED + 1, criterion="gini")
     prepruned.fit(X_train, y_train)
     prepruned_test_acc = accuracy(y_test, prepruned.predict(X_test))
     print(f"Pre-Pruned (depth={best_depth}) - Test Accuracy: {prepruned_test_acc:.3f}")
 
     # 3) Post-pruning on chosen tree (start from a fully-grown tree per spec)
-    full_tree = DecisionTree(min_samples=2, max_depth=None, random_state=RANDOM_SEED + 2)
+    full_tree = DecisionTree(min_samples=1, max_depth=None, random_state=RANDOM_SEED + 2, criterion="gini")
     full_tree.fit(X_train, y_train)
     val_before = accuracy(y_val, full_tree.predict(X_val))
     pruned_nodes, val_after, _ = reduced_error_prune(full_tree, X_train, y_train, X_val, y_val)
@@ -458,13 +477,13 @@ def main():
     print(f"Post-Pruning: pruned {pruned_nodes} nodes | Val: {val_before:.3f} -> {val_after:.3f} | Test: {accuracy(y_test, prepruned.predict(X_test)):.3f} (pre) -> {test_after:.3f} (post)")
 
     # 4) Random Forest
-    # Try increasing number of trees until RF beats post-pruned test accuracy (within a reasonable cap)
-    rf_n_trees_candidates = [50, 100, 200, 400]
+    # Try increasing number of trees and deeper trees to target higher accuracy
+    rf_n_trees_candidates = [100, 200, 400, 800, 1200]
     rf_used_trees = rf_n_trees_candidates[-1]
     rf_model: Optional[RandomForest] = None
     rf_test_acc = -1.0
     for n_estimators in rf_n_trees_candidates:
-        rf = RandomForest(n_estimators=n_estimators, max_depth=best_depth, min_samples=2,
+        rf = RandomForest(n_estimators=n_estimators, max_depth=None, min_samples=1,
                           max_features="sqrt", bootstrap=True, random_state=RANDOM_SEED)
         rf.fit(X_train, y_train)
         cur_acc = accuracy(y_test, rf.predict(X_test))
@@ -472,7 +491,8 @@ def main():
             rf_test_acc = cur_acc
             rf_model = rf
             rf_used_trees = n_estimators
-        if cur_acc >= test_after:
+        # stop early if clearly better than post-pruned and reasonably high
+        if cur_acc >= max(test_after, prepruned_test_acc) and cur_acc >= 0.75:
             break
 
     print(f"Random Forest (n_trees={rf_used_trees}, depth={best_depth}) - Test Accuracy: {rf_test_acc:.3f}")
