@@ -1,0 +1,5 @@
+Model,ValidationAccuracy,TestAccuracy
+Unpruned,,0.7833333333333333
+Pre-Pruned (depth=8),0.7666666666666667,0.8
+Post-Pruned,0.8166666666666667,0.7666666666666667
+Random Forest (n=100),0.7821428571428571,0.8
