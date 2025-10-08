@@ -311,6 +311,7 @@ class RandomForest:
         self.feature_subsets: List[np.ndarray] = []
         self.feature_importances_: Dict[int, float] = {}
         self.oob_error_curve_: List[float] = []
+        self.oob_score_: Optional[float] = None
 
     def _resolve_max_features(self, d: int) -> int:
         mf = self.max_features
@@ -374,6 +375,8 @@ class RandomForest:
                 oob_pred = (oob_sum[valid] >= (oob_cnt[valid] / 2.0)).astype(int)
                 oob_err = 1.0 - accuracy(y[valid], oob_pred)
                 self.oob_error_curve_.append(float(oob_err))
+                # track current OOB score
+                self.oob_score_ = 1.0 - float(oob_err)
             else:
                 self.oob_error_curve_.append(float("nan"))
 
@@ -473,6 +476,8 @@ def main():
             break
 
     print(f"Random Forest (n_trees={rf_used_trees}, depth={best_depth}) - Test Accuracy: {rf_test_acc:.3f}")
+    if rf_model is not None and rf_model.oob_score_ is not None:
+        print(f"Random Forest OOB Score (≈ Val Accuracy): {rf_model.oob_score_:.3f}")
 
     # OOB error curve plot for the chosen RF
     if rf_model is not None and len(rf_model.oob_error_curve_) > 0:
@@ -488,10 +493,10 @@ def main():
 
     # 5) Compare all models
     comp = pd.DataFrame([
-        {"Model": "Unpruned", "TestAccuracy": unpruned_test_acc},
-        {"Model": f"Pre-Pruned (depth={best_depth})", "TestAccuracy": prepruned_test_acc},
-        {"Model": "Post-Pruned", "TestAccuracy": test_after},
-        {"Model": f"Random Forest (n={rf_used_trees})", "TestAccuracy": rf_test_acc},
+        {"Model": "Unpruned", "ValidationAccuracy": np.nan, "TestAccuracy": unpruned_test_acc},
+        {"Model": f"Pre-Pruned (depth={best_depth})", "ValidationAccuracy": max(val_acc_by_depth), "TestAccuracy": prepruned_test_acc},
+        {"Model": "Post-Pruned", "ValidationAccuracy": val_after, "TestAccuracy": test_after},
+        {"Model": f"Random Forest (n={rf_used_trees})", "ValidationAccuracy": (rf_model.oob_score_ if rf_model and rf_model.oob_score_ is not None else np.nan), "TestAccuracy": rf_test_acc},
     ])
     comp.to_csv(Path(out_dir) / "model_comparison.csv", index=False)
     print("\nModel Comparison Table:\n", comp.to_string(index=False))
